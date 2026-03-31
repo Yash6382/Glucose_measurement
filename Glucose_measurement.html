@@ -875,7 +875,7 @@
     chip.className   = "status-chip " + levelClass(data.level);
     setTimeout(function() {
       var fill = document.getElementById("gauge-fill");
-      fill.style.width      = Math.min(100, Math.max(2, (data.glucose_mgdl / 400) * 100)).toFixed(1) + "%";
+      fill.style.width      = Math.min(100, Math.max(2, (data.glucose_mgdl / 250) * 100)).toFixed(1) + "%";
       fill.style.background = gaugeColor(data.level);
     }, 80);
     document.getElementById("result-note").innerHTML =
