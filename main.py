@@ -1,100 +1,101 @@
-"""
-GlucoSense — FastAPI backend
-Deploy on Render: https://render.com
-
-Files required in the same directory:
-  - best_model.pkl
-  - scaler.pkl
-"""
-
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+import os
 import joblib
 import numpy as np
-import os
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-# ── Load model & scaler once at startup ───────────────────────────────────────
+# --- Configuration ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, "best_model.pkl")
+SCALER_PATH = os.path.join(BASE_DIR, "scaler.pkl")
 
-try:
-    model  = joblib.load(os.path.join(BASE_DIR, "best_model.pkl"))
-    scaler = joblib.load(os.path.join(BASE_DIR, "scaler.pkl"))
-except FileNotFoundError as e:
-    raise RuntimeError(
-        f"Model file not found: {e}. "
-        "Make sure best_model.pkl and scaler.pkl are in the same folder as main.py."
-    )
+app = FastAPI(title="GlucoSense API", description="Non-invasive glucose prediction")
 
-# ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(
-    title="GlucoSense API",
-    description="Non-invasive blood glucose prediction from antenna S-parameter readings.",
-    version="1.0.0",
-)
-
+# Enable CORS for Vercel frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ── Schemas ───────────────────────────────────────────────────────────────────
+# --- Load Model & Scaler ---
+try:
+    model = joblib.load(MODEL_PATH)
+    scaler = joblib.load(SCALER_PATH)
+    print("Model and Scaler loaded successfully.")
+except Exception as e:
+    print(f"Error loading model/scaler: {e}")
+    model = None
+    scaler = None
+
+# --- Data Models ---
 class PredictRequest(BaseModel):
-    s11_freq_2ghz: float = Field(..., description="S11 resonant frequency ~2.2 GHz band (GHz)", example=2.19)
-    s11_db_2ghz:   float = Field(..., description="S11 magnitude ~2.2 GHz band (dB, negative)", example=-6.75)
-    s11_freq_5ghz: float = Field(..., description="S11 resonant frequency ~5.5 GHz band (GHz)", example=5.188)
-    s11_db_5ghz:   float = Field(..., description="S11 magnitude ~5.5 GHz band (dB, negative)", example=-13.57)
+    s11_freq_2ghz: float
+    s11_db_2ghz: float
+    s11_freq_5ghz: float
+    s11_db_5ghz: float
 
 class PredictResponse(BaseModel):
-    glucose_mgdl:    float
-    level:           str
+    glucose_mgdl: float
+    level: str
     confidence_note: str
 
-# ── Classifier ────────────────────────────────────────────────────────────────
-def classify(glucose: float) -> tuple[str, str]:
-    if glucose < 70:
-        return ("Low",
-                "Blood glucose is below 70 mg/dL (hypoglycemia). Consume fast-acting carbohydrates immediately.")
-    elif glucose <= 99:
-        return ("Normal",
-                "Blood glucose is within the normal fasting range (70–99 mg/dL). No immediate action needed.")
-    elif glucose <= 125:
-        return ("Pre-diabetic",
-                "Blood glucose is in the pre-diabetic range (100–125 mg/dL). Consult a healthcare provider.")
+# --- Logic ---
+def classify(value: float):
+    if value < 70:
+        return "Low", "Blood glucose is below 70 mg/dL. Consider consuming fast-acting carbohydrates."
+    elif 70 <= value <= 99:
+        return "Normal", "Blood glucose is within the healthy fasting range (70-99 mg/dL)."
+    elif 100 <= value <= 125:
+        return "Pre-diabetic", "Blood glucose is elevated (100-125 mg/dL). Consult a healthcare provider."
     else:
-        return ("Diabetic",
-                "Blood glucose is in the diabetic range (≥126 mg/dL). Seek medical advice promptly.")
+        return "Diabetic", "Blood glucose is in the diabetic range (126+ mg/dL). Seek medical advice."
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/")
-def health():
-    """
-    Health check — polled by the frontend every 2.5 s to detect when Render
-    wakes up from sleep. Returns immediately once model is loaded.
-    """
-    return {"status": "ok", "message": "GlucoSense API is running."}
-
+def health_check():
+    return {"status": "online", "model_loaded": model is not None}
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(payload: PredictRequest):
-    """
-    Predict blood glucose from four antenna S-parameter features.
-    Column order matches training data:
-      [S11_freq_2_2_4_GHz, S11_dB_2_2_4, S11_freq_5_5_3_GHz, S11_dB_5_5_3]
-    """
+    if model is None or scaler is None:
+        raise HTTPException(status_code=500, detail="Model or Scaler not initialized on server.")
+    
     try:
-        features = np.array([[
+        # Your scaler expects 10 features. We provide the 4 from the app 
+        # and pad the remaining 6 with 0.0 to satisfy the matrix dimensions.
+        input_list = [
             payload.s11_freq_2ghz,
             payload.s11_db_2ghz,
             payload.s11_freq_5ghz,
             payload.s11_db_5ghz,
-        ]])
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0  # Padding for the 6 missing columns
+        ]
+        
+        # Convert to numpy array and reshape for the scaler
+        features = np.array([input_list])
+        
+        # Apply Scaling
         features_scaled = scaler.transform(features)
-        prediction      = float(model.predict(features_scaled)[0])
-        prediction      = max(0.0, round(prediction, 1))
-        level, note     = classify(prediction)
-        return PredictResponse(glucose_mgdl=prediction, level=level, confidence_note=note)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        
+        # Run Prediction
+        # Note: If the model was trained on 10 features, it will receive the 10 scaled values.
+        prediction = float(model.predict(features_scaled)[0])
+        
+        # Clean up output
+        prediction = max(0.0, round(prediction, 1))
+        level, note = classify(prediction)
+        
+        return PredictResponse(
+            glucose_mgdl=prediction,
+            level=level,
+            confidence_note=note
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
